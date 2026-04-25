@@ -1,7 +1,9 @@
+// search-mcp — minimal MCP web search server (DuckDuckGo + Brave).
+// Transport: stdio / JSON-RPC 2.0. Zero external dependencies.
 package main
 
 import (
-	"context"
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,111 +13,96 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	"github.com/mark3labs/mcp-go/mcp"
-	"github.com/mark3labs/mcp-go/server"
 )
 
-// ── config ────────────────────────────────────────────────────────────────────
+var version = "dev"
+
+// ── config ───────────────────────────────────────────────────────────────────
 
 var (
-	braveAPIKey      = os.Getenv("BRAVE_API_KEY")
-	defaultProvider  = envOr("SEARCH_PROVIDER", "duckduckgo")
-	defaultMaxResult = envInt("SEARCH_MAX_RESULTS", 5)
-	timeoutSec       = envInt("SEARCH_TIMEOUT", 10)
+	braveAPIKey     = os.Getenv("BRAVE_API_KEY")
+	defaultProvider = envOr("SEARCH_PROVIDER", "duckduckgo")
+	defaultMax      = envInt("SEARCH_MAX_RESULTS", 5)
+	httpTimeout     = time.Duration(envInt("SEARCH_TIMEOUT", 10)) * time.Second
 )
 
-func envOr(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
+func envOr(k, def string) string {
+	if v := os.Getenv(k); v != "" {
 		return v
 	}
-	return fallback
+	return def
 }
 
-func envInt(key string, fallback int) int {
-	if v := os.Getenv(key); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
+func envInt(k string, def int) int {
+	if v := os.Getenv(k); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			return n
 		}
 	}
-	return fallback
+	return def
 }
 
-// ── HTTP client ───────────────────────────────────────────────────────────────
+var client = &http.Client{Timeout: httpTimeout}
 
-var httpClient = &http.Client{
-	Timeout: time.Duration(timeoutSec) * time.Second,
-}
+// ── search result ─────────────────────────────────────────────────────────────
 
-// ── result type ───────────────────────────────────────────────────────────────
-
-type Result struct {
+type result struct {
 	Title   string
 	URL     string
 	Snippet string
 }
 
-func formatResults(results []Result) string {
-	if len(results) == 0 {
+func formatResults(rs []result) string {
+	if len(rs) == 0 {
 		return "No results found."
 	}
-	var sb strings.Builder
-	for i, r := range results {
-		fmt.Fprintf(&sb, "%d. %s\n", i+1, r.Title)
+	var b strings.Builder
+	for i, r := range rs {
+		fmt.Fprintf(&b, "%d. %s\n", i+1, r.Title)
 		if r.URL != "" {
-			fmt.Fprintf(&sb, "   %s\n", r.URL)
+			fmt.Fprintf(&b, "   %s\n", r.URL)
 		}
 		if r.Snippet != "" {
-			fmt.Fprintf(&sb, "   %s\n", r.Snippet)
+			fmt.Fprintf(&b, "   %s\n", r.Snippet)
 		}
-		sb.WriteByte('\n')
+		b.WriteByte('\n')
 	}
-	return strings.TrimSpace(sb.String())
+	return strings.TrimSpace(b.String())
 }
 
 // ── DuckDuckGo ────────────────────────────────────────────────────────────────
 
-func searchDuckDuckGo(query string, max int) ([]Result, error) {
-	params := url.Values{
-		"q":           {query},
-		"format":      {"json"},
-		"no_html":     {"1"},
-		"no_redirect": {"1"},
-	}
-	req, _ := http.NewRequest(http.MethodGet,
-		"https://api.duckduckgo.com/?" + params.Encode(), nil)
-	req.Header.Set("Accept", "application/json")
+func searchDDG(query string, max int) ([]result, error) {
+	u := "https://api.duckduckgo.com/?" + url.Values{
+		"q": {query}, "format": {"json"},
+		"no_html": {"1"}, "no_redirect": {"1"},
+	}.Encode()
 
-	resp, err := httpClient.Do(req)
+	resp, err := client.Get(u)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
 
 	var data struct {
-		Heading       string `json:"Heading"`
-		Abstract      string `json:"Abstract"`
-		AbstractURL   string `json:"AbstractURL"`
+		Heading     string `json:"Heading"`
+		Abstract    string `json:"Abstract"`
+		AbstractURL string `json:"AbstractURL"`
 		RelatedTopics []struct {
 			Text     string `json:"Text"`
 			FirstURL string `json:"FirstURL"`
 		} `json:"RelatedTopics"`
 	}
-	if err := json.Unmarshal(body, &data); err != nil {
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
 		return nil, err
 	}
 
-	var results []Result
+	var rs []result
 	if data.Abstract != "" {
-		results = append(results, Result{
-			Title:   data.Heading,
-			URL:     data.AbstractURL,
-			Snippet: data.Abstract,
-		})
+		rs = append(rs, result{Title: data.Heading, URL: data.AbstractURL, Snippet: data.Abstract})
 	}
 	for _, t := range data.RelatedTopics {
-		if len(results) >= max {
+		if len(rs) >= max {
 			break
 		}
 		if t.Text != "" {
@@ -123,38 +110,34 @@ func searchDuckDuckGo(query string, max int) ([]Result, error) {
 			if len(title) > 80 {
 				title = title[:80]
 			}
-			results = append(results, Result{
-				Title:   title,
-				URL:     t.FirstURL,
-				Snippet: t.Text,
-			})
+			rs = append(rs, result{Title: title, URL: t.FirstURL, Snippet: t.Text})
 		}
 	}
-	return results[:min(len(results), max)], nil
+	if len(rs) > max {
+		rs = rs[:max]
+	}
+	return rs, nil
 }
 
 // ── Brave Search ──────────────────────────────────────────────────────────────
 
-func searchBrave(query string, max int) ([]Result, error) {
+func searchBrave(query string, max int) ([]result, error) {
 	if braveAPIKey == "" {
-		return nil, fmt.Errorf("BRAVE_API_KEY env variable is not set")
+		return nil, fmt.Errorf("BRAVE_API_KEY is not set")
 	}
-	params := url.Values{
-		"q":     {query},
-		"count": {strconv.Itoa(max)},
-	}
-	req, _ := http.NewRequest(http.MethodGet,
-		"https://api.search.brave.com/res/v1/web/search?"+params.Encode(), nil)
+	u := "https://api.search.brave.com/res/v1/web/search?" + url.Values{
+		"q": {query}, "count": {strconv.Itoa(max)},
+	}.Encode()
+
+	req, _ := http.NewRequest(http.MethodGet, u, nil)
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Accept-Encoding", "gzip")
 	req.Header.Set("X-Subscription-Token", braveAPIKey)
 
-	resp, err := httpClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
 
 	var data struct {
 		Web struct {
@@ -165,109 +148,227 @@ func searchBrave(query string, max int) ([]Result, error) {
 			} `json:"results"`
 		} `json:"web"`
 	}
-	if err := json.Unmarshal(body, &data); err != nil {
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
 		return nil, err
 	}
 
-	var results []Result
+	var rs []result
 	for _, item := range data.Web.Results {
-		if len(results) >= max {
+		if len(rs) >= max {
 			break
 		}
-		results = append(results, Result{
-			Title:   item.Title,
-			URL:     item.URL,
-			Snippet: item.Description,
-		})
+		rs = append(rs, result{Title: item.Title, URL: item.URL, Snippet: item.Description})
 	}
-	return results, nil
+	return rs, nil
 }
 
-// ── providers registry ────────────────────────────────────────────────────────
+// ── providers ─────────────────────────────────────────────────────────────────
 
-type providerFunc func(query string, max int) ([]Result, error)
+type providerFn func(query string, max int) ([]result, error)
 
-var providers = map[string]providerFunc{
-	"duckduckgo": searchDuckDuckGo,
+var providers = map[string]providerFn{
+	"duckduckgo": searchDDG,
 	"brave":      searchBrave,
 }
 
-// ── MCP tool handler ──────────────────────────────────────────────────────────
+// ── JSON-RPC 2.0 types ────────────────────────────────────────────────────────
 
-func handleSearch(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	query, err := req.RequireString("query")
-	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
-	}
-
-	providerName := defaultProvider
-	if p, ok := req.GetString("provider"); ok && p != "" {
-		providerName = p
-	}
-
-	maxResults := defaultMaxResult
-	if n, ok := req.GetInt("max_results"); ok && n > 0 {
-		maxResults = n
-	}
-
-	provider, ok := providers[providerName]
-	if !ok {
-		return mcp.NewToolResultError(
-			fmt.Sprintf("unknown provider %q, use: duckduckgo, brave", providerName),
-		), nil
-	}
-
-	results, err := provider(query, maxResults)
-	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
-	}
-	return mcp.NewToolResultText(formatResults(results)), nil
+type request struct {
+	JSONRPC string          `json:"jsonrpc"`
+	ID      json.RawMessage `json:"id"`
+	Method  string          `json:"method"`
+	Params  json.RawMessage `json:"params"`
 }
 
-// ── main ──────────────────────────────────────────────────────────────────────
+type response struct {
+	JSONRPC string          `json:"jsonrpc"`
+	ID      json.RawMessage `json:"id"`
+	Result  any             `json:"result,omitempty"`
+	Error   *rpcError       `json:"error,omitempty"`
+}
 
-func main() {
-	s := server.NewMCPServer(
-		"search-mcp",
-		"0.1.0",
-		server.WithToolCapabilities(false),
-	)
+type rpcError struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+}
 
+// ── MCP types ─────────────────────────────────────────────────────────────────
+
+type toolDef struct {
+	Name        string     `json:"name"`
+	Description string     `json:"description"`
+	InputSchema inputSchema `json:"inputSchema"`
+}
+
+type inputSchema struct {
+	Type       string              `json:"type"`
+	Properties map[string]schemaProp `json:"properties"`
+	Required   []string            `json:"required"`
+}
+
+type schemaProp struct {
+	Type        string   `json:"type"`
+	Description string   `json:"description"`
+	Enum        []string `json:"enum,omitempty"`
+	Minimum     *int     `json:"minimum,omitempty"`
+	Maximum     *int     `json:"maximum,omitempty"`
+}
+
+// ── tool list ─────────────────────────────────────────────────────────────────
+
+func toolList() []toolDef {
+	pmin, pmax := 1, 20
 	providerNames := make([]string, 0, len(providers))
 	for k := range providers {
 		providerNames = append(providerNames, k)
 	}
-
-	s.AddTool(
-		mcp.NewTool("search",
-			mcp.WithDescription(fmt.Sprintf(
-				"Search the web. Providers: %s. Default: %s.",
-				strings.Join(providerNames, ", "), defaultProvider,
-			)),
-			mcp.WithString("query",
-				mcp.Required(),
-				mcp.Description("Search query"),
-			),
-			mcp.WithString("provider",
-				mcp.Description("Override provider: duckduckgo or brave"),
-				mcp.Enum("duckduckgo", "brave"),
-			),
-			mcp.WithNumber("max_results",
-				mcp.Description("Max results (1-20), overrides SEARCH_MAX_RESULTS"),
-			),
+	return []toolDef{{
+		Name: "search",
+		Description: fmt.Sprintf(
+			"Search the web. Providers: %s. Default: %s.",
+			strings.Join(providerNames, ", "), defaultProvider,
 		),
-		handleSearch,
-	)
-
-	if err := server.ServeStdio(s); err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		os.Exit(1)
-	}
+		InputSchema: inputSchema{
+			Type: "object",
+			Properties: map[string]schemaProp{
+				"query": {
+					Type:        "string",
+					Description: "Search query",
+				},
+				"provider": {
+					Type:        "string",
+					Description: "Override provider (duckduckgo, brave)",
+					Enum:        providerNames,
+				},
+				"max_results": {
+					Type:        "integer",
+					Description: "Max results to return (1–20)",
+					Minimum:     &pmin,
+					Maximum:     &pmax,
+				},
+			},
+			Required: []string{"query"},
+		},
+	}}
 }
 
-func min(a, b int) int {
-	if a < b {
-		return a
+// ── call tool ─────────────────────────────────────────────────────────────────
+
+func callTool(params json.RawMessage) (any, *rpcError) {
+	var p struct {
+		Name      string          `json:"name"`
+		Arguments json.RawMessage `json:"arguments"`
 	}
-	return b
+	if err := json.Unmarshal(params, &p); err != nil {
+		return nil, &rpcError{-32602, "invalid params: " + err.Error()}
+	}
+	if p.Name != "search" {
+		return nil, &rpcError{-32601, "unknown tool: " + p.Name}
+	}
+
+	var args struct {
+		Query      string `json:"query"`
+		Provider   string `json:"provider"`
+		MaxResults int    `json:"max_results"`
+	}
+	if err := json.Unmarshal(p.Arguments, &args); err != nil {
+		return nil, &rpcError{-32602, "invalid arguments: " + err.Error()}
+	}
+	if args.Query == "" {
+		return nil, &rpcError{-32602, "query is required"}
+	}
+
+	providerName := defaultProvider
+	if args.Provider != "" {
+		providerName = args.Provider
+	}
+	maxResults := defaultMax
+	if args.MaxResults > 0 {
+		maxResults = args.MaxResults
+	}
+
+	provider, ok := providers[providerName]
+	if !ok {
+		return nil, &rpcError{-32602, fmt.Sprintf("unknown provider %q", providerName)}
+	}
+
+	rs, err := provider(args.Query, maxResults)
+	if err != nil {
+		// tool error — return as content, not RPC error
+		return map[string]any{
+			"content": []map[string]any{{"type": "text", "text": "Error: " + err.Error()}},
+			"isError": true,
+		}, nil
+	}
+	return map[string]any{
+		"content": []map[string]any{{"type": "text", "text": formatResults(rs)}},
+	}, nil
+}
+
+// ── MCP dispatcher ────────────────────────────────────────────────────────────
+
+func handle(req request) response {
+	resp := response{JSONRPC: "2.0", ID: req.ID}
+
+	switch req.Method {
+	case "initialize":
+		resp.Result = map[string]any{
+			"protocolVersion": "2024-11-05",
+			"serverInfo":      map[string]any{"name": "search-mcp", "version": version},
+			"capabilities":    map[string]any{"tools": map[string]any{}},
+		}
+
+	case "notifications/initialized", "notifications/cancelled":
+		// fire-and-forget — no response
+		return response{}
+
+	case "tools/list":
+		resp.Result = map[string]any{"tools": toolList()}
+
+	case "tools/call":
+		result, rpcErr := callTool(req.Params)
+		if rpcErr != nil {
+			resp.Error = rpcErr
+		} else {
+			resp.Result = result
+		}
+
+	case "ping":
+		resp.Result = map[string]any{}
+
+	default:
+		resp.Error = &rpcError{-32601, "method not found: " + req.Method}
+	}
+
+	return resp
+}
+
+// ── main loop ─────────────────────────────────────────────────────────────────
+
+func main() {
+	enc := json.NewEncoder(os.Stdout)
+	scanner := bufio.NewScanner(os.Stdin)
+	scanner.Buffer(make([]byte, 1<<20), 1<<20) // 1 MiB line buffer
+
+	for scanner.Scan() {
+		var req request
+		if err := json.Unmarshal(scanner.Bytes(), &req); err != nil {
+			_ = enc.Encode(response{
+				JSONRPC: "2.0",
+				Error:   &rpcError{-32700, "parse error: " + err.Error()},
+			})
+			continue
+		}
+		resp := handle(req)
+		// skip notification responses (empty struct, no ID)
+		if resp.JSONRPC == "" {
+			continue
+		}
+		_ = enc.Encode(resp)
+	}
+
+	if err := scanner.Err(); err != nil && err != io.EOF {
+		fmt.Fprintf(os.Stderr, "stdin error: %v\n", err)
+		os.Exit(1)
+	}
 }
