@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -17,7 +18,48 @@ import (
 
 var version = "dev"
 
-// ── config ───────────────────────────────────────────────────────────────────
+// ── logger ────────────────────────────────────────────────────────────────────
+//
+// LOG_LEVEL=debug  — все события: входящие методы, вызовы провайдеров, ответы
+// LOG_LEVEL=error  — только ошибки (rpc + provider)
+// LOG_LEVEL=off    — тишина (по умолчанию)
+
+type logLevel int
+
+const (
+	levelOff   logLevel = iota
+	levelError logLevel = iota
+	levelDebug logLevel = iota
+)
+
+var currentLevel logLevel
+
+var logger = log.New(os.Stderr, "", log.Ltime|log.Lmicroseconds)
+
+func initLog() {
+	switch strings.ToLower(os.Getenv("LOG_LEVEL")) {
+	case "debug":
+		currentLevel = levelDebug
+	case "error":
+		currentLevel = levelError
+	default:
+		currentLevel = levelOff
+	}
+}
+
+func logDebug(format string, v ...any) {
+	if currentLevel >= levelDebug {
+		logger.Printf("[DEBUG] "+format, v...)
+	}
+}
+
+func logError(format string, v ...any) {
+	if currentLevel >= levelError {
+		logger.Printf("[ERROR] "+format, v...)
+	}
+}
+
+// ── config ────────────────────────────────────────────────────────────────────
 
 var (
 	braveAPIKey     = os.Getenv("BRAVE_API_KEY")
@@ -78,11 +120,13 @@ func searchDDG(query string, max int) ([]result, error) {
 		"no_html": {"1"}, "no_redirect": {"1"},
 	}.Encode()
 
+	logDebug("ddg request: %s", u)
 	resp, err := client.Get(u)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
+	logDebug("ddg response: status=%s", resp.Status)
 
 	var data struct {
 		Heading     string `json:"Heading"`
@@ -116,6 +160,7 @@ func searchDDG(query string, max int) ([]result, error) {
 	if len(rs) > max {
 		rs = rs[:max]
 	}
+	logDebug("ddg results: %d", len(rs))
 	return rs, nil
 }
 
@@ -133,11 +178,13 @@ func searchBrave(query string, max int) ([]result, error) {
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("X-Subscription-Token", braveAPIKey)
 
+	logDebug("brave request: %s", u)
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
+	logDebug("brave response: status=%s", resp.Status)
 
 	var data struct {
 		Web struct {
@@ -159,6 +206,7 @@ func searchBrave(query string, max int) ([]result, error) {
 		}
 		rs = append(rs, result{Title: item.Title, URL: item.URL, Snippet: item.Description})
 	}
+	logDebug("brave results: %d", len(rs))
 	return rs, nil
 }
 
@@ -195,15 +243,15 @@ type rpcError struct {
 // ── MCP types ─────────────────────────────────────────────────────────────────
 
 type toolDef struct {
-	Name        string     `json:"name"`
-	Description string     `json:"description"`
+	Name        string      `json:"name"`
+	Description string      `json:"description"`
 	InputSchema inputSchema `json:"inputSchema"`
 }
 
 type inputSchema struct {
-	Type       string              `json:"type"`
+	Type       string                `json:"type"`
 	Properties map[string]schemaProp `json:"properties"`
-	Required   []string            `json:"required"`
+	Required   []string              `json:"required"`
 }
 
 type schemaProp struct {
@@ -292,14 +340,16 @@ func callTool(params json.RawMessage) (any, *rpcError) {
 		return nil, &rpcError{-32602, fmt.Sprintf("unknown provider %q", providerName)}
 	}
 
+	logDebug("search query=%q provider=%s max=%d", args.Query, providerName, maxResults)
 	rs, err := provider(args.Query, maxResults)
 	if err != nil {
-		// tool error — return as content, not RPC error
+		logError("provider %s error: %v", providerName, err)
 		return map[string]any{
 			"content": []map[string]any{{"type": "text", "text": "Error: " + err.Error()}},
 			"isError": true,
 		}, nil
 	}
+	logDebug("search done: %d results", len(rs))
 	return map[string]any{
 		"content": []map[string]any{{"type": "text", "text": formatResults(rs)}},
 	}, nil
@@ -308,6 +358,7 @@ func callTool(params json.RawMessage) (any, *rpcError) {
 // ── MCP dispatcher ────────────────────────────────────────────────────────────
 
 func handle(req request) response {
+	logDebug("→ method=%s id=%s", req.Method, req.ID)
 	resp := response{JSONRPC: "2.0", ID: req.ID}
 
 	switch req.Method {
@@ -319,7 +370,7 @@ func handle(req request) response {
 		}
 
 	case "notifications/initialized", "notifications/cancelled":
-		// fire-and-forget — no response
+		logDebug("notification ignored: %s", req.Method)
 		return response{}
 
 	case "tools/list":
@@ -328,6 +379,7 @@ func handle(req request) response {
 	case "tools/call":
 		result, rpcErr := callTool(req.Params)
 		if rpcErr != nil {
+			logError("tools/call rpc error: %d %s", rpcErr.Code, rpcErr.Message)
 			resp.Error = rpcErr
 		} else {
 			resp.Result = result
@@ -337,15 +389,21 @@ func handle(req request) response {
 		resp.Result = map[string]any{}
 
 	default:
+		logError("unknown method: %s", req.Method)
 		resp.Error = &rpcError{-32601, "method not found: " + req.Method}
 	}
 
+	logDebug("← method=%s id=%s ok=%v", req.Method, req.ID, resp.Error == nil)
 	return resp
 }
 
 // ── main loop ─────────────────────────────────────────────────────────────────
 
 func main() {
+	initLog()
+	logDebug("search-mcp %s starting (provider=%s, max=%d, timeout=%s)",
+		version, defaultProvider, defaultMax, httpTimeout)
+
 	enc := json.NewEncoder(os.Stdout)
 	scanner := bufio.NewScanner(os.Stdin)
 	scanner.Buffer(make([]byte, 1<<20), 1<<20) // 1 MiB line buffer
@@ -353,6 +411,7 @@ func main() {
 	for scanner.Scan() {
 		var req request
 		if err := json.Unmarshal(scanner.Bytes(), &req); err != nil {
+			logError("parse error: %v", err)
 			_ = enc.Encode(response{
 				JSONRPC: "2.0",
 				Error:   &rpcError{-32700, "parse error: " + err.Error()},
@@ -360,7 +419,6 @@ func main() {
 			continue
 		}
 		resp := handle(req)
-		// skip notification responses (empty struct, no ID)
 		if resp.JSONRPC == "" {
 			continue
 		}
@@ -368,7 +426,7 @@ func main() {
 	}
 
 	if err := scanner.Err(); err != nil && err != io.EOF {
-		fmt.Fprintf(os.Stderr, "stdin error: %v\n", err)
+		logError("stdin: %v", err)
 		os.Exit(1)
 	}
 }
