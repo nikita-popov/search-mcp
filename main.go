@@ -1,4 +1,4 @@
-// search-mcp — minimal MCP web search server (DuckDuckGo + Brave).
+// search-mcp — minimal MCP web search server.
 // Transport: stdio / JSON-RPC 2.0. Zero external dependencies.
 package main
 
@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -18,11 +19,11 @@ import (
 
 var version = "dev"
 
-// ── logger ────────────────────────────────────────────────────────────────────
+// ── logger ───────────────────────────────────────────────────────────────────
 //
-// SEARCH_LOG_LEVEL=debug - все события: входящие методы, вызовы провайдеров, ответы
-// SEARCH_LOG_LEVEL=error - только ошибки (rpc + provider)
-// SEARCH_LOG_LEVEL=off   - тишина (по умолчанию)
+// LOG_LEVEL=debug  — все события
+// LOG_LEVEL=error  — только ошибки
+// LOG_LEVEL=off    — тишина (по умолчанию)
 
 type logLevel int
 
@@ -33,11 +34,10 @@ const (
 )
 
 var currentLevel logLevel
-
 var logger = log.New(os.Stderr, "", log.Ltime|log.Lmicroseconds)
 
 func initLog() {
-	switch strings.ToLower(os.Getenv("SEARCH_LOG_LEVEL")) {
+	switch strings.ToLower(os.Getenv("LOG_LEVEL")) {
 	case "debug":
 		currentLevel = levelDebug
 	case "error":
@@ -59,10 +59,11 @@ func logError(format string, v ...any) {
 	}
 }
 
-// ── config ────────────────────────────────────────────────────────────────────
+// ── config ───────────────────────────────────────────────────────────────────
 
 var (
 	braveAPIKey     = os.Getenv("BRAVE_API_KEY")
+	searxngURL      = envOr("SEARXNG_URL", "http://localhost:8080")
 	defaultProvider = envOr("SEARCH_PROVIDER", "duckduckgo")
 	defaultMax      = envInt("SEARCH_MAX_RESULTS", 5)
 	httpTimeout     = time.Duration(envInt("SEARCH_TIMEOUT", 10)) * time.Second
@@ -86,7 +87,7 @@ func envInt(k string, def int) int {
 
 var client = &http.Client{Timeout: httpTimeout}
 
-// ── search result ─────────────────────────────────────────────────────────────
+// ── search result ────────────────────────────────────────────────────────────
 
 type result struct {
 	Title   string
@@ -112,59 +113,71 @@ func formatResults(rs []result) string {
 	return strings.TrimSpace(b.String())
 }
 
-// ── DuckDuckGo ────────────────────────────────────────────────────────────────
+// ── DuckDuckGo (HTML scrape) ───────────────────────────────────────────────────────
+//
+// DDG Instant Answer API (возвращает 202 и пустой ответ для большинства запросов)
+// работает только для structured lookups (Wikipedia и похожее).
+// Для обычных запросов скрейпим HTML lite.
+
+var (
+	// <a class="... result__a ..." href="...">title</a>
+	ddgLinkRe    = regexp.MustCompile(`class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>([^<]+)<`)
+	// <a class="result__snippet ..."...>snippet</a>
+	ddgSnippetRe = regexp.MustCompile(`class="[^"]*result__snippet[^"]*"[^>]*>([^<]+)<`)
+)
 
 func searchDDG(query string, max int) ([]result, error) {
-	u := "https://api.duckduckgo.com/?" + url.Values{
-		"q": {query}, "format": {"json"},
-		"no_html": {"1"}, "no_redirect": {"1"},
-	}.Encode()
+	u := "https://html.duckduckgo.com/html/?" + url.Values{"q": {query}}.Encode()
+
+	req, _ := http.NewRequest(http.MethodGet, u, nil)
+	// DDG блокирует Go дефолтный UA
+	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
 
 	logDebug("ddg request: %s", u)
-	resp, err := client.Get(u)
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 	logDebug("ddg response: status=%s", resp.Status)
 
-	var data struct {
-		Heading     string `json:"Heading"`
-		Abstract    string `json:"Abstract"`
-		AbstractURL string `json:"AbstractURL"`
-		RelatedTopics []struct {
-			Text     string `json:"Text"`
-			FirstURL string `json:"FirstURL"`
-		} `json:"RelatedTopics"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
 		return nil, err
 	}
+	html := string(body)
+
+	links := ddgLinkRe.FindAllStringSubmatch(html, -1)
+	snippets := ddgSnippetRe.FindAllStringSubmatch(html, -1)
 
 	var rs []result
-	if data.Abstract != "" {
-		rs = append(rs, result{Title: data.Heading, URL: data.AbstractURL, Snippet: data.Abstract})
-	}
-	for _, t := range data.RelatedTopics {
+	for i, m := range links {
 		if len(rs) >= max {
 			break
 		}
-		if t.Text != "" {
-			title := t.Text
-			if len(title) > 80 {
-				title = title[:80]
+		rawURL := m[1]
+		// DDG заворачивает ссылки через redirect, достаём оригинальный URL
+		if parsed, err := url.Parse(rawURL); err == nil {
+			if ud := parsed.Query().Get("uddg"); ud != "" {
+				rawURL = ud
 			}
-			rs = append(rs, result{Title: title, URL: t.FirstURL, Snippet: t.Text})
 		}
-	}
-	if len(rs) > max {
-		rs = rs[:max]
+		snippet := ""
+		if i < len(snippets) {
+			snippet = strings.TrimSpace(snippets[i][1])
+		}
+		rs = append(rs, result{
+			Title:   strings.TrimSpace(m[2]),
+			URL:     rawURL,
+			Snippet: snippet,
+		})
 	}
 	logDebug("ddg results: %d", len(rs))
 	return rs, nil
 }
 
-// ── Brave Search ──────────────────────────────────────────────────────────────
+// ── Brave Search ─────────────────────────────────────────────────────────────
 
 func searchBrave(query string, max int) ([]result, error) {
 	if braveAPIKey == "" {
@@ -210,16 +223,58 @@ func searchBrave(query string, max int) ([]result, error) {
 	return rs, nil
 }
 
-// ── providers ─────────────────────────────────────────────────────────────────
+// ── SearXNG ─────────────────────────────────────────────────────────────────────
+//
+// Требует работающий экземпляр SearXNG с включеным JSON-форматом вывода.
+// Настройка: SEARXNG_URL (default: http://localhost:8080)
+
+func searchSearXNG(query string, max int) ([]result, error) {
+	u := strings.TrimRight(searxngURL, "/") + "/search?" + url.Values{
+		"q":      {query},
+		"format": {"json"},
+	}.Encode()
+
+	logDebug("searxng request: %s", u)
+	resp, err := client.Get(u)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	logDebug("searxng response: status=%s", resp.Status)
+
+	var data struct {
+		Results []struct {
+			Title   string `json:"title"`
+			URL     string `json:"url"`
+			Content string `json:"content"`
+		} `json:"results"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return nil, err
+	}
+
+	var rs []result
+	for _, item := range data.Results {
+		if len(rs) >= max {
+			break
+		}
+		rs = append(rs, result{Title: item.Title, URL: item.URL, Snippet: item.Content})
+	}
+	logDebug("searxng results: %d", len(rs))
+	return rs, nil
+}
+
+// ── providers ────────────────────────────────────────────────────────────────
 
 type providerFn func(query string, max int) ([]result, error)
 
 var providers = map[string]providerFn{
 	"duckduckgo": searchDDG,
 	"brave":      searchBrave,
+	"searxng":    searchSearXNG,
 }
 
-// ── JSON-RPC 2.0 types ────────────────────────────────────────────────────────
+// ── JSON-RPC 2.0 types ───────────────────────────────────────────────────────
 
 type request struct {
 	JSONRPC string          `json:"jsonrpc"`
@@ -240,7 +295,7 @@ type rpcError struct {
 	Message string `json:"message"`
 }
 
-// ── MCP types ─────────────────────────────────────────────────────────────────
+// ── MCP types ───────────────────────────────────────────────────────────────
 
 type toolDef struct {
 	Name        string      `json:"name"`
@@ -262,7 +317,7 @@ type schemaProp struct {
 	Maximum     *int     `json:"maximum,omitempty"`
 }
 
-// ── tool list ─────────────────────────────────────────────────────────────────
+// ── tool list ───────────────────────────────────────────────────────────────
 
 func toolList() []toolDef {
 	pmin, pmax := 1, 20
@@ -285,7 +340,7 @@ func toolList() []toolDef {
 				},
 				"provider": {
 					Type:        "string",
-					Description: "Override provider (duckduckgo, brave)",
+					Description: "Override provider for this call",
 					Enum:        providerNames,
 				},
 				"max_results": {
@@ -300,7 +355,7 @@ func toolList() []toolDef {
 	}}
 }
 
-// ── call tool ─────────────────────────────────────────────────────────────────
+// ── call tool ────────────────────────────────────────────────────────────────
 
 func callTool(params json.RawMessage) (any, *rpcError) {
 	var p struct {
@@ -355,7 +410,7 @@ func callTool(params json.RawMessage) (any, *rpcError) {
 	}, nil
 }
 
-// ── MCP dispatcher ────────────────────────────────────────────────────────────
+// ── MCP dispatcher ──────────────────────────────────────────────────────────
 
 func handle(req request) response {
 	logDebug("→ method=%s id=%s", req.Method, req.ID)
@@ -397,7 +452,7 @@ func handle(req request) response {
 	return resp
 }
 
-// ── main loop ─────────────────────────────────────────────────────────────────
+// ── main loop ────────────────────────────────────────────────────────────────
 
 func main() {
 	initLog()
@@ -406,7 +461,7 @@ func main() {
 
 	enc := json.NewEncoder(os.Stdout)
 	scanner := bufio.NewScanner(os.Stdin)
-	scanner.Buffer(make([]byte, 1<<20), 1<<20) // 1 MiB line buffer
+	scanner.Buffer(make([]byte, 1<<20), 1<<20)
 
 	for scanner.Scan() {
 		var req request
