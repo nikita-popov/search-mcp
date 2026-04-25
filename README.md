@@ -1,36 +1,34 @@
 # search-mcp
 
-Minimal MCP server for web search. Works over **stdio**, configured via ENV variables.  
+Minimal MCP web search server written in Go. Works over **stdio**, configured via ENV variables.  
 Providers: **DuckDuckGo** (no key required) and **Brave Search** (API key required).
 
-## Install
+## Build
 
 ```bash
-pip install -e .
+go build -o search-mcp .
 ```
 
-Or without cloning:
+Or install directly:
 
 ```bash
-pip install git+https://github.com/nikita-popov/search-mcp.git
+go install github.com/nikita-popov/search-mcp@latest
 ```
 
 ## Run
 
 ```bash
 search-mcp
-# or
-python -m search_mcp
 ```
 
 ## ENV variables
 
-| Variable              | Default      | Description                              |
-|-----------------------|--------------|------------------------------------------|
-| `SEARCH_PROVIDER`     | `duckduckgo` | Default provider: `duckduckgo` or `brave`|
-| `BRAVE_API_KEY`       | —            | Required only when using Brave provider  |
-| `SEARCH_MAX_RESULTS`  | `5`          | Default number of results to return      |
-| `SEARCH_TIMEOUT`      | `10`         | HTTP request timeout in seconds          |
+| Variable             | Default      | Description                               |
+|----------------------|--------------|-------------------------------------------|
+| `SEARCH_PROVIDER`    | `duckduckgo` | Default provider: `duckduckgo` or `brave` |
+| `BRAVE_API_KEY`      | —            | Required only when using Brave provider   |
+| `SEARCH_MAX_RESULTS` | `5`          | Default number of results to return       |
+| `SEARCH_TIMEOUT`     | `10`         | HTTP request timeout in seconds           |
 
 ## MCP client config
 
@@ -40,7 +38,7 @@ python -m search_mcp
 {
   "mcpServers": {
     "search": {
-      "command": "search-mcp"
+      "command": "/usr/local/bin/search-mcp"
     }
   }
 }
@@ -52,7 +50,7 @@ python -m search_mcp
 {
   "mcpServers": {
     "search": {
-      "command": "search-mcp",
+      "command": "/usr/local/bin/search-mcp",
       "env": {
         "SEARCH_PROVIDER": "brave",
         "BRAVE_API_KEY": "YOUR_KEY_HERE"
@@ -66,10 +64,15 @@ python -m search_mcp
 
 **`search`** — search the web.
 
-Arguments:
+| Argument      | Type   | Required | Description                                      |
+|---------------|--------|----------|--------------------------------------------------|
+| `query`       | string | ✅       | Search query                                     |
+| `provider`    | string | —        | Override provider for this call                  |
+| `max_results` | number | —        | Override max results for this call (1–20)        |
 
-| Name          | Type    | Required | Description                                         |
-|---------------|---------|----------|-----------------------------------------------------|
-| `query`       | string  | ✅       | Search query                                        |
-| `provider`    | string  | —        | Override provider for this call (`duckduckgo`, `brave`) |
-| `max_results` | integer | —        | Override max results for this call (1–20)           |
+## Adding a provider
+
+1. Write `func searchFoo(query string, max int) ([]Result, error)`
+2. Register it: `providers["foo"] = searchFoo`
+
+Done.
