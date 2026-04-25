@@ -6,7 +6,7 @@ Providers: **DuckDuckGo** (no key required) and **Brave Search** (API key requir
 ## Build
 
 ```bash
-go build -o search-mcp .
+make
 ```
 
 Or install directly:
@@ -25,6 +25,7 @@ search-mcp
 
 | Variable             | Default      | Description                               |
 |----------------------|--------------|-------------------------------------------|
+| `SEARCH_LOG_LEVEL`   |               | Log to `stderr`                               |
 | `SEARCH_PROVIDER`    | `duckduckgo` | Default provider: `duckduckgo` or `brave` |
 | `BRAVE_API_KEY`      | —            | Required only when using Brave provider   |
 | `SEARCH_MAX_RESULTS` | `5`          | Default number of results to return       |

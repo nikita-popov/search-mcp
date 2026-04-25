@@ -20,9 +20,9 @@ var version = "dev"
 
 // ── logger ────────────────────────────────────────────────────────────────────
 //
-// LOG_LEVEL=debug  — все события: входящие методы, вызовы провайдеров, ответы
-// LOG_LEVEL=error  — только ошибки (rpc + provider)
-// LOG_LEVEL=off    — тишина (по умолчанию)
+// SEARCH_LOG_LEVEL=debug - все события: входящие методы, вызовы провайдеров, ответы
+// SEARCH_LOG_LEVEL=error - только ошибки (rpc + provider)
+// SEARCH_LOG_LEVEL=off   - тишина (по умолчанию)
 
 type logLevel int
 
@@ -37,7 +37,7 @@ var currentLevel logLevel
 var logger = log.New(os.Stderr, "", log.Ltime|log.Lmicroseconds)
 
 func initLog() {
-	switch strings.ToLower(os.Getenv("LOG_LEVEL")) {
+	switch strings.ToLower(os.Getenv("SEARCH_LOG_LEVEL")) {
 	case "debug":
 		currentLevel = levelDebug
 	case "error":
